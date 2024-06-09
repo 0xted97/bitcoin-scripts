@@ -1,0 +1,1 @@
+node --experimental-specifier-resolution=node --loader ts-node/esm ./src/staking.ts

@@ -1,5 +1,8 @@
-import { networks } from "bitcoinjs-lib";
+
 import * as bitcoin from "bitcoinjs-lib";
+import { tapleafHash } from "bitcoinjs-lib/src/payments/bip341";
+import { Taptree } from "bitcoinjs-lib/src/types";
+
 import * as bip32Factory from "bip32";
 import * as bip39 from "bip39";
 import * as ecc from 'tiny-secp256k1';
@@ -8,9 +11,12 @@ import * as fs from "fs";
 import { config } from 'dotenv';
 import { toXOnly } from "bitcoinjs-lib/src/psbt/bip371";
 import { getNetworkConfig, currentNetwork } from "./configs";
-import { createWitness, StakingScriptData, stakingTransaction, unbondingTransaction, withdrawTimelockUnbondedTransaction } from "btc-staking-ts";
+import { createWitness, StakingScriptData, stakingTransaction, unbondingTransaction, withdrawEarlyUnbondedTransaction, withdrawTimelockUnbondedTransaction } from "btc-staking-ts";
 import { getPublicKeyNoCoord } from "./utils/helper";
-import { broadcast, getBlockHeight, getFundingUTXOs, getUTXOs } from "./utils/blockstream.utils";
+import { broadcast, getBlockHeight, getFundingUTXOs, getTransactionHex, getUTXOs } from "./utils/blockstream.utils";
+import { UnbondingPayload } from "./types";
+import { params } from "./constants";
+
 
 
 
@@ -72,6 +78,7 @@ const getStaker = async () => {
         address: address!,
         pubkeyHex: childNode.publicKey.toString("hex"),
         publicKeyNoCoord: getPublicKeyNoCoord(childNode.publicKey.toString("hex")),
+        publicKeyNoCoordHex: getPublicKeyNoCoord(childNode.publicKey.toString("hex")).toString("hex"),
         scriptPubKeyHex: output!.toString("hex"),
         childNodeXOnlyPubkey: childNodeXOnlyPubkey.toString("hex"),
     };
@@ -83,8 +90,8 @@ const getCovenants = async () => {
     const seed = await bip39.mnemonicToSeed(mnemonic);
     const rootKey = bip32.fromSeed(seed);
     const covenantKeys = [];
-    const total = 3;
-    for (let i = 10; i < 10 + 3; i++) {
+    const total = 9;
+    for (let i = 10; i < 10 + 9; i++) {
         const path = `m/86'/0'/0'/0/${i}`;
         const childNode = rootKey.derivePath(path);
         const childNodeXOnlyPubkey = toXOnly(childNode.publicKey);
@@ -92,15 +99,29 @@ const getCovenants = async () => {
             childNodeXOnlyPubkey.toString('hex'),
             'hex');
         // Get taproot address
-        const { address, output } = bitcoin.payments.p2tr({
+        const covenantTaproot = bitcoin.payments.p2tr({
             internalPubkey,
             network: currentNetwork,
         });
+        const { address, output } = covenantTaproot;
+        const ecPair = bip32.fromPrivateKey(childNode.privateKey!, childNode.chainCode);
+        // console.log("🚀 ~ getCovenants ~ childNode:", childNode.privateKey?.toString("hex"), address?.toString())
+
+
         covenantKeys.push({
+            ecPair,
+            childNode,
+            rootKey,
+            covenantTaproot,
+            path,
+            rawPath: `m/86'/0'/0'/0/`,
             address: address!,
             pubkeyHex: childNode.publicKey.toString("hex"),
+            pubkeyBuffer: childNode.publicKey,
             publicKeyNoCoord: getPublicKeyNoCoord(childNode.publicKey.toString("hex")),
+            publicKeyNoCoordHex: getPublicKeyNoCoord(childNode.publicKey.toString("hex")).toString("hex"),
             scriptPubKeyHex: output!.toString("hex"),
+            internalPubkey,
         });
     }
 
@@ -109,6 +130,145 @@ const getCovenants = async () => {
         covenantThreshold: Math.round(total / 2) + 1,
     };
 
+}
+
+const LEAF_VERSION = 0xc0; // Default leaf version for Taproot
+
+// function tapleafHash(script: Buffer): Buffer {
+//     const leafVersion = Buffer.from([LEAF_VERSION]); // Default leaf version for Taproot // 192
+//     const scriptLength = Buffer.from([script.length]); // Script length in bytes
+//     return bitcoin.crypto.taggedHash("TapLeaf", Buffer.concat([leafVersion, scriptLength, script]));
+// }
+
+
+// Utility function to create a Taproot control block
+function createControlBlock(internalPubKey: Buffer, leafHash: Buffer): Buffer {
+    const parity = Buffer.from([internalPubKey[0] % 2 === 0 ? 0 : 1]);
+    return Buffer.concat([parity, internalPubKey,]);
+}
+
+
+// Utility function to create a TapLeafScript object
+function createTapLeafScript(script: Buffer, internalPubKey: Buffer): { controlBlock: Buffer, script: Buffer, leafVersion: number } {
+    const leafHash = tapleafHash({
+        output: script,
+    });
+
+    const controlBlock = createControlBlock(internalPubKey, leafHash);
+    return {
+        controlBlock,
+        script,
+        leafVersion: LEAF_VERSION,
+    };
+}
+
+const getScriptsStaking = async () => {
+    const unspendableKeyPathKey = Buffer.from('50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0', 'hex');
+    const finalityProvider = await getFinalityProvider();
+    const staker = await getStaker();
+    const covenants = await getCovenants();
+    const { covenantKeys, covenantThreshold } = covenants;
+    const { minUnbondingTime, magicBytes, stakingAmount, stakingDuration, unbondingTime } = params;
+
+    const stakingScriptData = new StakingScriptData(
+        staker.publicKeyNoCoord,
+        [finalityProvider.publicKeyNoCoord],
+        covenantKeys.map((c) => c.publicKeyNoCoord),
+        covenantThreshold,
+        stakingDuration,
+        unbondingTime,
+        magicBytes,
+    );
+
+
+
+    const {
+        timelockScript,
+        unbondingScript,
+        slashingScript,
+        dataEmbedScript,
+        unbondingTimelockScript,
+    } = stakingScriptData.buildScripts();
+
+    const unbondingPaths: Buffer[] = [];
+    unbondingPaths.push(timelockScript);
+    unbondingPaths.push(unbondingScript);
+    unbondingPaths.push(slashingScript);
+
+    const timeLockLeafHash = tapleafHash({
+        output: timelockScript,
+    })
+    const unbondingPathLeafHash = tapleafHash({
+        output: unbondingScript,
+    })
+    const slashingLeafHash = tapleafHash({
+        output: slashingScript,
+    })
+
+    const unbondScriptTree: Taptree = [
+        {
+            output: slashingScript,
+        },
+        { output: timelockScript }
+
+    ];
+
+    const unbondTaproot = bitcoin.payments.p2tr({
+        internalPubkey: unspendableKeyPathKey,
+        scriptTree: unbondScriptTree,
+        network: currentNetwork,
+    })
+
+
+    const stakingScriptTree: Taptree = [
+        {
+            output: slashingScript,
+        },
+        [{ output: unbondingScript }, { output: timelockScript }],
+    ];
+    const stakingTaproot = bitcoin.payments.p2tr({
+        internalPubkey: unspendableKeyPathKey,
+        scriptTree: stakingScriptTree,
+        network: currentNetwork,
+    })
+
+
+    // Calculate internal node hash (hash of unbondingHash and timelockHash)
+    const internalNodeHash = bitcoin.crypto.sha256(Buffer.concat([unbondingPathLeafHash, timeLockLeafHash]));
+    // Calculate root hash (hash of slashingHash and internalNodeHash)
+    const rootHash = bitcoin.crypto.sha256(Buffer.concat([slashingLeafHash, internalNodeHash]));
+
+    // Calculate Merkle Proof for unbondingScript (internalNodeHash and slashingHash)
+    const merkleProof = [internalNodeHash, slashingLeafHash];
+    const version = Buffer.from([0xc0]); // Taproot version byte
+    const controlBlock = Buffer.concat([version, unspendableKeyPathKey, ...merkleProof]);
+
+
+    console.table({
+        stakingAddress: stakingTaproot.address?.toString(),
+        unbondAddress: unbondTaproot.address?.toString(),
+        timeLockLeafHash: timeLockLeafHash.toString("hex"),
+        unbondingPathLeafHash: unbondingPathLeafHash.toString("hex"),
+        slashingLeafHash: slashingLeafHash.toString("hex"),
+    });
+
+    return {
+        timelockScript,
+        unbondingScript,
+        slashingScript,
+        dataEmbedScript,
+        unbondingTimelockScript,
+
+        unbondingPaths,
+        slashingLeafHash,
+        timeLockLeafHash,
+        unbondingPathLeafHash,
+
+        stakingTaproot,
+        unbondTaproot,
+
+        controlBlock
+    }
 }
 
 /**
@@ -139,32 +299,138 @@ const updateStakingDataWithdrawn = async (index: number, withdrawalTx: string) =
 }
 
 
+async function validateRequestPayloadUnbonding(body: UnbondingPayload) {
 
-async function createUnbonding(index: number = 0) {
+    return body;
+}
+
+async function validateStakingTransaction(txId: string) {
+    // validate staking transaction
+    return true;
+}
+
+async function getStakingHexFromApi(txId: string): Promise<bitcoin.Transaction> {
+    const staking = await getTransactionHex(txId);
+    const psbt = bitcoin.Transaction.fromHex(staking);
+    return psbt;
+}
+
+/**
+ * API in Server to request unbonding
+ * @param body 
+ */
+async function requestUnbonding(body: UnbondingPayload) {
+    const { staker_signed_signature_hex, staking_tx_hash_hex, unbonding_tx_hash_hex, unbonding_tx_hex } = await validateRequestPayloadUnbonding(body);
+    const unbondingTx = bitcoin.Transaction.fromHex(unbonding_tx_hex);
+    const stakingTransaction = await getStakingHexFromApi(staking_tx_hash_hex);
+
+    // TODO: Validate ouput index must be 0
+    // stakingOutputIndexFromUnbondingTx := unbondingTx.TxIn[0].PreviousOutPoint.Index
+    // Mean: input of unbond equals output of staking
+
+
+    // TODO: expectedUnbondingOutputValue = staking amount - unbonding fee
+    // Should be validated
+
+
+    const stakingTxId = unbondingTx.ins[0].hash.reverse().toString("hex");
+    const unbondingOutput = unbondingTx.outs[0];
+    const unbondingInput = unbondingTx.ins[0];
+
+
+    const unbondingExpectedAmount = unbondingOutput.value; // amount - unbond fee = this
+    // original witness
+    const unbondingWitness = unbondingTx.ins[0].witness;
+    await validateStakingTransaction(stakingTxId);
+    const { unbondingScript, unbondingPathLeafHash, stakingTaproot, unbondTaproot, controlBlock } = await getScriptsStaking();
+
+    // 5120, 51 is OP_PUSHDATA1, 20 indicate next 32 bytes
+
+
+
+    const covenantKeys = await getCovenants();
+    const covenantThreshold = covenantKeys.covenantThreshold;
+    const covenantSignatures = covenantKeys.covenantKeys.map((c) => {
+        // TODO: Get control block
+
+        const psbt = new bitcoin.Psbt({ network: currentNetwork })
+        psbt.setLocktime(unbondingTx.locktime)
+        psbt.setVersion(unbondingTx.version)
+
+
+        psbt.addInput({
+            hash: unbondingTx.ins[0].hash,
+            index: unbondingTx.ins[0].index,
+            sequence: unbondingTx.ins[0].sequence,
+            witnessUtxo: {
+                script: stakingTransaction.outs[0].script,
+                value: stakingTransaction.outs[0].value,
+            },
+
+            // bip32Derivation: [{
+            //     masterFingerprint: c.childNode.fingerprint,
+            //     pubkey: c.covenantTaproot.pubkey,
+            //     path: c.path,
+            // }],
+            tapInternalKey: stakingTaproot.internalPubkey,
+            tapLeafScript: [{
+                leafVersion: LEAF_VERSION,
+                script: unbondingScript,
+                controlBlock: controlBlock
+            }],
+        });
+
+        psbt.addOutput({
+            script: unbondingOutput.script,
+            value: unbondingOutput.value,
+        });
+
+        psbt.signInput(0, c.ecPair);
+        const input0 = psbt!.data!.inputs[0]
+        const schnorrSignature = input0.tapScriptSig ? input0.tapScriptSig[0].signature : "0x";
+
+        psbt.finalizeAllInputs();
+
+
+        return {
+            covenant_pk: c.pubkeyBuffer,
+            btc_pk_hex: c.pubkeyHex,
+            sig_hex: schnorrSignature.toString("hex"),
+        }
+    });
+    
+    const witness = createWitness(
+        unbondingWitness,
+        covenantSignatures.map((c) => c.covenant_pk),
+        covenantSignatures.map((c) => ({ btc_pk_hex: c.btc_pk_hex, sig_hex: c.sig_hex })),
+    );
+
+    unbondingTx.setWitness(0, witness);
+    console.log("🚀 ~ requestUnbonding ~ unbondingTransaction:", unbondingTx.ins[0])
+    console.log("🚀 ~ requestUnbonding ~ unbondingTransaction:", unbondingTx.outs[0])
+
+
+    const txId = await broadcast(unbondingTx.toHex());
+    console.log("🚀 ~ requestUnbonding ~ txId:", txId)
+
+}
+
+
+async function createUnbonding(index: number): Promise<UnbondingPayload> {
     const finalityProvider = await getFinalityProvider();
     const staker = await getStaker();
     const covenants = await getCovenants();
+
 
 
     const { covenantKeys, covenantThreshold } = covenants;
 
 
     const stakingTxData = await getStakingData(index);
+    console.log("🚀 ~ createUnbonding ~ stakingTxData:", stakingTxData.txId)
 
     const { stakingDuration, unbondingTime } = stakingTxData;
-
-    const magicBytes: Buffer = Buffer.from("62627434", "hex"); // "bbt4" tag
-    const unbondingFee: number = 500;
-
-    const stakingScriptData = new StakingScriptData(
-        staker.publicKeyNoCoord,
-        [finalityProvider.publicKeyNoCoord],
-        covenantKeys.map((c) => c.publicKeyNoCoord),
-        covenantThreshold,
-        stakingDuration,
-        unbondingTime,
-        magicBytes,
-    );
+    const { unbondingFee } = params;
 
     const {
         timelockScript,
@@ -172,9 +438,10 @@ async function createUnbonding(index: number = 0) {
         slashingScript,
         unbondingTimelockScript,
         dataEmbedScript,
-    } = stakingScriptData.buildScripts();
+    } = await getScriptsStaking();
 
     const stakingTx = bitcoin.Transaction.fromHex(stakingTxData.stakingTx);
+
     const { psbt } = unbondingTransaction(
         {
             timelockScript,
@@ -190,11 +457,23 @@ async function createUnbonding(index: number = 0) {
 
     psbt.signInput(0, staker.ecPair);
     psbt.finalizeAllInputs();
-    const unbondingTx = psbt.extractTransaction();
+
+    const unbondingTx = psbt.extractTransaction()
+
 
     const stakerSignature = unbondingTx.ins[0].witness[0].toString("hex");
-    console.log("🚀 ~ createUnbonding ~ stakerSignature:", stakerSignature)
+    console.log("🚀 ~ createUnbonding ~ stakerSignature:", unbondingTx.ins[0].hash.toString("hex"))
+    console.log("🚀 ~ createUnbonding ~ stakerSignature:", unbondingTx.ins[0].witness)
 
+    const result: UnbondingPayload = {
+        staker_signed_signature_hex: stakerSignature,
+        staking_tx_hash_hex: stakingTxData.txId,
+        unbonding_tx_hash_hex: unbondingTx.getId(),
+        unbonding_tx_hex: unbondingTx.toHex(),
+    }
+
+
+    return result;
 }
 
 async function createWithdrawTimelockUnbonded(index: number) {
@@ -264,24 +543,7 @@ async function createStaking() {
     const staker = await getStaker();
     const covenants = await getCovenants();
 
-
-    const { covenantKeys, covenantThreshold } = covenants;
-    const minUnbondingTime: number = 101;
-    const magicBytes: Buffer = Buffer.from("62627434", "hex"); // "bbt4" tag
-    const stakingDuration: number = 10;
-    const stakingAmount: number = 1249;
-    const unbondingTime: number = minUnbondingTime;
-
-    const stakingScriptData = new StakingScriptData(
-        staker.publicKeyNoCoord,
-        [finalityProvider.publicKeyNoCoord],
-        covenantKeys.map((c) => c.publicKeyNoCoord),
-        covenantThreshold,
-        stakingDuration,
-        unbondingTime,
-        magicBytes,
-    );
-
+    const { minUnbondingTime, magicBytes, stakingAmount, stakingDuration, unbondingTime, feeRate } = params;
 
     const {
         timelockScript,
@@ -289,12 +551,11 @@ async function createStaking() {
         slashingScript,
         dataEmbedScript,
         unbondingTimelockScript,
-    } = stakingScriptData.buildScripts();
+    } = await getScriptsStaking();
 
 
     const changeAddress = staker.address;
     const inputUTXOs = await getFundingUTXOs(staker.address, stakingAmount);
-    const feeRate = 1;
     const lockHeight = await getBlockHeight();
 
     const unsignedStakingPsbt: { psbt: bitcoin.Psbt, fee: number } = stakingTransaction(
@@ -347,10 +608,20 @@ async function createStaking() {
 }
 
 async function main() {
-    const stake = await createStaking();
+    // const stake = await createStaking();
     // console.log("🚀 ~ main ~ stake:", stake)
-    createUnbonding(6);
-    createWithdrawTimelockUnbonded(6);
-    // const tx = bitcoin.Transaction.fromHex("0200000000010176131b3d969e65abdb00b908fbcd128eb8045732ba4b4b5e2a1ba7f714374c380200000000fdffffff03f401000000000000225120539fe5bf403883f88a62c2253e60350f5f545c3c8f8d3f767937e7c434084cc00000000000000000496a476262743400ad7ff9ff8f630a594dc524e6c23d163c62e665fb40d5f2fafb8be66a7c14e9e63207d52ae5aa65120f3c30355d195b0bdf38a8e0d7fef63da42d26cf9ec33288000a8b5c0100000000002251206c33c3ef367ecf6702e94a2cfeec5bccb265bd48381d3796504b9a3f9c4d10590140c51fb79ef2f0a85ecfd2198cd27ff0af5de085d436b81f3de9992cd20a43e34a755e230864839ffc4c4a964cecaded67cba5e445c2800a10ddb10b798db94626bb080300")
+    const payload = await createUnbonding(10);
+    const collectCovenantSigs = await requestUnbonding(payload);
+    // createWithdrawTimelockUnbonded(1);
+}
+
+async function getPubKeys() {
+    const staker = await getStaker();
+    console.log("🚀 ~ getPubKeys ~ staker:", staker)
+    const covenantKeys = await getCovenants();
+    console.log("🚀 ~ getPubKeys ~ covenantKeys:", covenantKeys.covenantKeys.map((c) => c.pubkeyHex))
+    const finalityProvider = await getFinalityProvider();
+    console.log("🚀 ~ getPubKeys ~ finalityProvider:", finalityProvider)
+
 }
 main();

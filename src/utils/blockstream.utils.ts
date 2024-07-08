@@ -11,6 +11,11 @@ const blockstream = new axios.Axios({
   baseURL: `${mempoolApiUrl}/api`
 });
 
+export async function getTransactionHex(txIdHex: string) {
+  const response: AxiosResponse<string> = await blockstream.get(`/tx/${txIdHex}/hex`);
+  return response.data;
+}
+
 export async function broadcast(txHex: string) {
   const response: AxiosResponse<string> = await blockstream.post('/tx', txHex);
   return response.data;
